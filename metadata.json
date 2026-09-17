@@ -1,0 +1,6 @@
+{
+  "name": "Qadir Family",
+  "description": "Family heritage application featuring a natural visual family tree, shared family documents, passcode registration, and comprehensive admin management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

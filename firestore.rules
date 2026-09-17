@@ -1,0 +1,271 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================
+    // AUTHENTICATION & CORE SECURITY HELPERS
+    // ==========================================
+
+    // Helper: Verify user is authenticated via Firebase Authentication
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper: Verify email is verified in Firebase Auth token
+    function isEmailVerified() {
+      return isAuthenticated() && request.auth.token.get('email_verified', false) == true;
+    }
+
+    // Helper: Verify administrator status exclusively via Firebase Custom Claims
+    // (A normal client cannot grant itself admin through Firestore data)
+    function isAdmin() {
+      return isAuthenticated() && (
+        request.auth.token.get('admin', false) == true ||
+        request.auth.token.get('role', '') == 'admin'
+      );
+    }
+
+    // Helper: Verify user ownership of document
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Helper: Retrieve caller's verified memberId from their user document
+    function getCallerMemberId() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('memberId', '');
+    }
+
+    // Helper: Strengthened isApprovedMember() validating all 7 strict criteria:
+    // 1. Authenticated
+    // 2. email_verified == true
+    // 3. users/{uid} exists
+    // 4. users/{uid}.isApproved == true
+    // 5. users/{uid}.memberId is non-empty
+    // 6. members/{memberId} exists
+    // 7. members/{memberId}.accountUid == request.auth.uid
+    function isApprovedMember() {
+      return isAuthenticated() &&
+        isEmailVerified() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('isApproved', false) == true &&
+        getCallerMemberId() != '' &&
+        exists(/databases/$(database)/documents/members/$(getCallerMemberId())) &&
+        get(/databases/$(database)/documents/members/$(getCallerMemberId())).data.get('accountUid', '') == request.auth.uid;
+    }
+
+    // Helper: Verify caller is parent or spouse of parent for a child being added
+    function isParentOfNewChild() {
+      return (
+        request.resource.data.get('fatherId', '') == getCallerMemberId() ||
+        request.resource.data.get('motherId', '') == getCallerMemberId() ||
+        (
+          exists(/databases/$(database)/documents/members/$(getCallerMemberId())) &&
+          get(/databases/$(database)/documents/members/$(getCallerMemberId())).data.get('spouseId', null) != null &&
+          (
+            request.resource.data.get('fatherId', '') == get(/databases/$(database)/documents/members/$(getCallerMemberId())).data.get('spouseId', '') ||
+            request.resource.data.get('motherId', '') == get(/databases/$(database)/documents/members/$(getCallerMemberId())).data.get('spouseId', '')
+          )
+        )
+      );
+    }
+
+    // ==========================================
+    // 1. PUBLIC FAMILY CONFIGURATION (/settings/family_config)
+    // Contains non-sensitive metadata: familyName, tagline, rootFatherId, rootMotherId
+    // familyPasscode is strictly forbidden here.
+    // ==========================================
+    match /settings/family_config {
+      // Only approved + email-verified family members and admins can view family config
+      allow read: if isAdmin() || isApprovedMember();
+
+      // Root initialization and root-slot claims:
+      // Do not allow arbitrary authenticated users to initialize or modify family_config.
+      // Root initialization and root-slot claims must be performed only by admin/trusted backend logic.
+      // familyPasscode is strictly forbidden in family_config.
+      allow create, update: if isAdmin() && !('familyPasscode' in request.resource.data);
+
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 2. SENSITIVE REGISTRATION SECRETS (/settings/secrets)
+    // Holds family passcode & registration secrets
+    // Strictly restricted to admins and server Cloud Functions
+    // ==========================================
+    match /settings/secrets {
+      allow read, write: if isAdmin();
+    }
+
+    match /admin/{doc=**} {
+      allow read, write: if isAdmin();
+    }
+
+    match /audit_logs/{logId} {
+      allow read, write: if isAdmin();
+    }
+
+    // ==========================================
+    // 3. USER ACCOUNTS (/users/{userId})
+    // ==========================================
+    match /users/{userId} {
+      // Admins read all; user reads only their own account document
+      allow read: if isAuthenticated() && (isAdmin() || isOwner(userId));
+
+      // After successful Firebase Auth, user creates ONLY their own user record.
+      // Force memberId to empty string or null.
+      // Normal users must never choose or modify: role, isApproved, memberId.
+      allow create: if isAuthenticated() && (
+        isAdmin() || (
+          isOwner(userId) &&
+          request.resource.data.uid == request.auth.uid &&
+          request.resource.data.get('role', 'member') == 'member' &&
+          request.resource.data.get('isApproved', false) == false &&
+          (request.resource.data.get('memberId', '') == '' || request.resource.data.get('memberId', null) == null)
+        )
+      );
+
+      // Profile updates:
+      // Normal users can update non-critical profile fields (fullName, phone, etc.),
+      // but MUST NEVER modify: role, isApproved, memberId.
+      // Only admin or trusted backend can link and approve a member.
+      allow update: if isAuthenticated() && (
+        isAdmin() || (
+          isOwner(userId) &&
+          request.resource.data.get('role', resource.data.get('role', 'member')) == resource.data.get('role', 'member') &&
+          request.resource.data.get('isApproved', resource.data.get('isApproved', false)) == resource.data.get('isApproved', false) &&
+          request.resource.data.get('memberId', resource.data.get('memberId', '')) == resource.data.get('memberId', '')
+        )
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 4. PENDING REGISTRATIONS (/registrations/{registrationId})
+    // Normal self-registration creates ONLY a pending registration.
+    // Client cannot decide their own lineage, branch, or approval.
+    // ==========================================
+    match /registrations/{registrationId} {
+      // Admins read all; user reads only their own pending registration
+      allow read: if isAuthenticated() && (
+        isAdmin() || resource.data.get('uid', '') == request.auth.uid
+      );
+
+      // Authenticated users create their own pending registration request.
+      // Client cannot self-approve; status must be 'pending'.
+      // They cannot forge uid.
+      allow create: if isAuthenticated() &&
+        request.resource.data.get('uid', '') == request.auth.uid &&
+        request.resource.data.get('status', 'pending') == 'pending';
+
+      // Only admins or Cloud Functions can approve, update, or delete registrations
+      allow update, delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 5. FAMILY MEMBERS (/members/{memberId})
+    // Protected member tree data. CNIC is strictly excluded here.
+    // ==========================================
+    match /members/{memberId} {
+      // Protected family data: Only approved + email-verified family members and admins can read
+      allow read: if isAdmin() || isApprovedMember();
+
+      // Deletions are strictly admin-only
+      allow delete: if isAdmin();
+
+      // Member updates:
+      // Admins can update any member.
+      // Approved members can update only their own profile, and CANNOT change lineage or approval.
+      allow update: if isAdmin() || (
+        isApprovedMember() &&
+        resource.data.get('accountUid', '') == request.auth.uid &&
+        request.resource.data.get('accountUid', '') == resource.data.get('accountUid', '') &&
+        request.resource.data.get('generation', 0) == resource.data.get('generation', 0) &&
+        request.resource.data.get('fatherId', '') == resource.data.get('fatherId', '') &&
+        request.resource.data.get('motherId', '') == resource.data.get('motherId', '') &&
+        request.resource.data.get('spouseId', '') == resource.data.get('spouseId', '') &&
+        request.resource.data.get('isApproved', false) == resource.data.get('isApproved', false) &&
+        request.resource.data.get('cnic', null) == null
+      );
+
+      // Creating members:
+      // Case A: Admin or Cloud Function can create member documents (including Root Parents generation 0)
+      // Case B: Normal approved member adding a child under their own branch:
+      // - Caller must be an approved member
+      // - Must validate required fields (fullName is non-empty string, valid gender)
+      // - child.generation must be strictly caller.generation + 1
+      // - fatherId or motherId must be the caller's memberId (or caller's spouse)
+      // - accountUid and cnic must be null
+      allow create: if isAdmin() || (
+        isApprovedMember() &&
+        request.resource.data.get('fullName', '') is string &&
+        request.resource.data.get('fullName', '').size() > 0 &&
+        request.resource.data.get('gender', '') in ['Male', 'Female'] &&
+        request.resource.data.get('accountUid', null) == null &&
+        request.resource.data.get('cnic', null) == null &&
+        request.resource.data.get('generation', 0) == get(/databases/$(database)/documents/members/$(getCallerMemberId())).data.get('generation', 0) + 1 &&
+        isParentOfNewChild()
+      );
+    }
+
+    // ==========================================
+    // 6. SENSITIVE IDENTITY RECORDS (/sensitive_records/{memberId})
+    // Stores CNIC, National Identity, and private credentials.
+    // ==========================================
+    match /sensitive_records/{memberId} {
+      // Normal user may read ONLY their own sensitive record:
+      // Require: users/{uid}.memberId == memberId AND sensitive record accountUid == request.auth.uid
+      allow read: if isAdmin() || (
+        isApprovedMember() &&
+        getCallerMemberId() == memberId &&
+        resource.data.get('accountUid', '') == request.auth.uid
+      );
+
+      // Normal user may create ONLY their own sensitive record:
+      // Require: users/{uid}.memberId == memberId AND sensitive record accountUid == request.auth.uid
+      // Never allow a user to create a sensitive record for another member.
+      allow create: if isAdmin() || (
+        isApprovedMember() &&
+        getCallerMemberId() == memberId &&
+        request.resource.data.get('accountUid', '') == request.auth.uid
+      );
+
+      // Normal user may update ONLY their own sensitive record
+      allow update: if isAdmin() || (
+        isApprovedMember() &&
+        getCallerMemberId() == memberId &&
+        resource.data.get('accountUid', '') == request.auth.uid &&
+        request.resource.data.get('accountUid', '') == request.auth.uid
+      );
+
+      // Deletions are strictly admin-only
+      allow delete: if isAdmin();
+    }
+
+    // ==========================================
+    // 7. FAMILY DOCUMENTS (/documents/{documentId})
+    // Family records, certificates, and ID documents
+    // ==========================================
+    match /documents/{documentId} {
+      // Only approved + email-verified family members and admins can read family documents
+      allow read: if isAdmin() || isApprovedMember();
+
+      // Approved members and admins can upload documents linked to their own accountUid
+      allow create: if (isAdmin() || isApprovedMember()) &&
+        request.resource.data.get('uploadedBy', '') == request.auth.uid;
+
+      // Only admins or document uploader can update or delete documents
+      allow update, delete: if isAdmin() || (
+        isApprovedMember() && resource.data.get('uploadedBy', '') == request.auth.uid
+      );
+    }
+
+    // ==========================================
+    // DEFAULT CATCH-ALL
+    // Strictly restricted to admins only
+    // ==========================================
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
